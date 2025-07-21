@@ -47,7 +47,7 @@ def get_whisper_model():
     if _model is None:
         logger.info("Loading Whisper model...")
         try:
-            _model = whisper.load_model("base")
+            _model = whisper.load_model("tiny")
             logger.info("Whisper model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
