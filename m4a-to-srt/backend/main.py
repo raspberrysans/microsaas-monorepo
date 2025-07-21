@@ -20,8 +20,7 @@ app = FastAPI(title="M4A to SRT Converter", version="1.0.0")
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
-    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -247,6 +246,16 @@ async def test():
     """Simple test endpoint."""
     logger.info("Test endpoint called")
     return {"message": "API is working", "timestamp": "2024-01-01"}
+
+@app.options("/api/convert")
+async def options_convert():
+    """Handle preflight requests for the convert endpoint."""
+    from fastapi.responses import Response
+    response = Response()
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 if __name__ == "__main__":
     import uvicorn
