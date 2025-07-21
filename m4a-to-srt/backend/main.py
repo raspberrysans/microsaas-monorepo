@@ -21,9 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static files (frontend)
-app.mount("/static", StaticFiles(directory="../frontend"), name="static")
-
 # Global whisper model instance for reuse
 _model = None
 
