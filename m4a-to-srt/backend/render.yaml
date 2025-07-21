@@ -1,0 +1,12 @@
+# @format
+
+services:
+  - type: web
+    name: m4a-to-srt-converter
+    env: python
+    plan: starter
+    buildCommand: pip install --upgrade pip && pip install torch --extra-index-url https://download.pytorch.org/whl/cpu && pip install git+https://github.com/openai/whisper.git && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
