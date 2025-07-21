@@ -5,11 +5,21 @@ from typing import Optional
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import re
 from datetime import timedelta
 
 app = FastAPI(title="M4A to SRT Converter", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Serve static files (frontend)
 app.mount("/static", StaticFiles(directory="../frontend"), name="static")
@@ -96,7 +106,7 @@ def generate_srt(segments: list, words_per_segment: int, frame_rate: float) -> s
     
     return "\n".join(srt_content)
 
-@app.post("/convert/")
+@app.post("/api/convert")
 async def convert_m4a_to_srt(
     file: UploadFile = File(...),
     words_per_segment: Optional[int] = Form(0, description="Number of words per subtitle segment (0 for no segmentation)"),
@@ -150,11 +160,18 @@ async def convert_m4a_to_srt(
         
         # Return SRT file
         filename = file.filename.replace(".m4a", ".srt")
+        
+        async def cleanup():
+            try:
+                os.unlink(temp_srt_path)
+            except OSError:
+                pass  # File might already be deleted
+        
         return FileResponse(
             temp_srt_path,
             media_type="application/x-subrip",
             filename=filename,
-            background=lambda: os.unlink(temp_srt_path)
+            background=cleanup
         )
         
     except Exception as e:
@@ -167,8 +184,20 @@ async def convert_m4a_to_srt(
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Serve the frontend interface."""
-    with open("../frontend/index.html", "r", encoding="utf-8") as f:
-        return HTMLResponse(content=f.read())
+    try:
+        with open("../frontend/index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="""
+        <html>
+            <head><title>M4A to SRT API</title></head>
+            <body>
+                <h1>M4A to SRT Converter API</h1>
+                <p>API is running. Use POST /api/convert to convert M4A files to SRT.</p>
+                <p>Frontend not found. Please deploy the frontend separately or check the file path.</p>
+            </body>
+        </html>
+        """)
 
 @app.get("/health")
 async def health():

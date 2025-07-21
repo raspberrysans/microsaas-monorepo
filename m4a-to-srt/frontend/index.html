@@ -311,7 +311,7 @@
 				success.style.display = 'none';
 
 				try {
-					const response = await fetch('/convert/', {
+					const response = await fetch('/api/convert', {
 						method: 'POST',
 						body: formData,
 					});
