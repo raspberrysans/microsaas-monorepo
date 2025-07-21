@@ -89,7 +89,8 @@ def generate_srt(segments: list, words_per_segment: int, frame_rate: float) -> s
         else:
             srt_content.append(f"{segment_counter}")
             srt_content.append(f"{start_time} --> {end_time}")
-            srt_content.append(f"{segment["text"].strip()}")
+            text_segment: str = segment['text']
+            srt_content.append(f"{text_segment.strip()}")
             srt_content.append("")
             segment_counter += 1
     
