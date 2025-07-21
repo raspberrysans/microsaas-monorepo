@@ -1,6 +1,7 @@
 import os
 import tempfile
 import whisper
+import logging
 from typing import Optional
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -9,6 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import re
 from datetime import timedelta
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="M4A to SRT Converter", version="1.0.0")
 
@@ -21,6 +26,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application on startup."""
+    logger.info("Starting M4A to SRT Converter API...")
+    try:
+        # Preload the Whisper model
+        get_whisper_model()
+        logger.info("Application startup completed successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize application: {e}")
+        # Don't raise here to allow the app to start even if model loading fails
+        logger.warning("Continuing without preloaded model")
+
 # Global whisper model instance for reuse
 _model = None
 
@@ -28,7 +46,13 @@ def get_whisper_model():
     """Get or initialize the Whisper model singleton."""
     global _model
     if _model is None:
-        _model = whisper.load_model("base")
+        logger.info("Loading Whisper model...")
+        try:
+            _model = whisper.load_model("base")
+            logger.info("Whisper model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+            raise
     return _model
 
 def format_timestamp(seconds: float) -> str:
@@ -109,6 +133,7 @@ async def convert_m4a_to_srt(
     words_per_segment: Optional[int] = Form(0, description="Number of words per subtitle segment (0 for no segmentation)"),
     frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations")
 ):
+    logger.info(f"Received conversion request for file: {file.filename}")
     """
     Convert M4A audio file to SRT subtitle format using OpenAI Whisper.
     
@@ -130,33 +155,44 @@ async def convert_m4a_to_srt(
         raise HTTPException(status_code=400, detail="Frame rate must be positive")
     
     try:
+        logger.info("Creating temporary files...")
         # Create temporary files
         with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_m4a:
             content = await file.read()
             temp_m4a.write(content)
             temp_m4a_path = temp_m4a.name
+        logger.info(f"Temporary file created: {temp_m4a_path}")
         
         # Convert M4A to WAV
+        logger.info("Converting M4A to WAV...")
         wav_path = convert_audio_to_wav(temp_m4a_path)
+        logger.info(f"WAV file created: {wav_path}")
         
         # Load Whisper model and transcribe
+        logger.info("Loading Whisper model and transcribing...")
         model = get_whisper_model()
         result = model.transcribe(wav_path)
+        logger.info("Transcription completed")
         
         # Generate SRT content
+        logger.info("Generating SRT content...")
         srt_content = generate_srt(result["segments"], words_per_segment, frame_rate)
         
         # Create temporary SRT file
+        logger.info("Creating SRT file...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".srt", mode="w", encoding="utf-8") as temp_srt:
             temp_srt.write(srt_content)
             temp_srt_path = temp_srt.name
+        logger.info(f"SRT file created: {temp_srt_path}")
         
         # Clean up temporary files
+        logger.info("Cleaning up temporary files...")
         os.unlink(temp_m4a_path)
         os.unlink(wav_path)
         
         # Return SRT file
         filename = file.filename.replace(".m4a", ".srt")
+        logger.info(f"Returning SRT file: {filename}")
         
         async def cleanup():
             try:
@@ -172,10 +208,14 @@ async def convert_m4a_to_srt(
         )
         
     except Exception as e:
+        logger.error(f"Conversion failed: {str(e)}")
         # Clean up on error
         for path in [temp_m4a_path, wav_path]:
             if 'path' in locals() and os.path.exists(path):
-                os.unlink(path)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
 
 @app.get("/", response_class=HTMLResponse)
@@ -199,8 +239,16 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint."""
+    logger.info("Health check endpoint called")
     return {"message": "M4A to SRT Converter API", "status": "healthy"}
+
+@app.get("/test")
+async def test():
+    """Simple test endpoint."""
+    logger.info("Test endpoint called")
+    return {"message": "API is working", "timestamp": "2024-01-01"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port) 
