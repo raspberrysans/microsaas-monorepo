@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import re
+import json
 from datetime import timedelta
 
 # Configure logging
@@ -47,7 +48,7 @@ def get_whisper_model():
     if _model is None:
         logger.info("Loading Whisper model...")
         try:
-            _model = whisper.load_model("tiny")
+            _model = whisper.load_model("base")
             logger.info("Whisper model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
@@ -62,16 +63,6 @@ def format_timestamp(seconds: float) -> str:
     secs = int(td.total_seconds() % 60)
     millisecs = int((td.total_seconds() % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
-
-def segment_text_by_words(text: str, words_per_segment: int) -> list[str]:
-    """Segment text into chunks based on word count."""
-    words = text.split()
-    segments = []
-    for i in range(0, len(words), words_per_segment):
-        segment = " ".join(words[i:i + words_per_segment])
-        if segment.strip():
-            segments.append(segment)
-    return segments
 
 def convert_audio_to_wav(audio_path: str) -> str:
     """Convert M4A to WAV format for Whisper processing using ffmpeg."""
@@ -92,54 +83,166 @@ def convert_audio_to_wav(audio_path: str) -> str:
     except FileNotFoundError:
         raise Exception("FFmpeg not found. Please install ffmpeg.")
 
-def generate_srt(segments: list, words_per_segment: int, frame_rate: float) -> str:
-    """Generate SRT content from Whisper segments."""
-    srt_content = []
-    segment_counter = 1
+def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
+    """Use OpenAI Whisper for transcription with word-level timestamps"""
+    logger.info("Transcribing audio with Whisper word-level timestamps...")
     
-    for segment in segments:
-        start_time = format_timestamp(segment["start"])
-        end_time = format_timestamp(segment["end"])
+    try:
+        # Try to use whisper command line tool with word-level timestamps
+        temp_dir = tempfile.mkdtemp()
+        result = subprocess.run([
+            'whisper', audio_path, 
+            '--model', 'base',
+            '--output_format', 'json',
+            '--word_timestamps', 'True',
+            '--output_dir', temp_dir
+        ], capture_output=True, text=True, check=True)
         
-        # Segment text by word count if specified
-        if words_per_segment > 0:
-            text_segments = segment_text_by_words(segment["text"], words_per_segment)
-            segment_duration = segment["end"] - segment["start"]
-            sub_segment_duration = segment_duration / len(text_segments)
+        # Find the output JSON file
+        base_name = os.path.splitext(os.path.basename(audio_path))[0]
+        json_path = os.path.join(temp_dir, f"{base_name}.json")
+        
+        if os.path.exists(json_path):
+            with open(json_path, 'r', encoding='utf-8') as f:
+                whisper_result = json.load(f)
             
-            for i, text_segment in enumerate(text_segments):
-                sub_start = segment["start"] + (i * sub_segment_duration)
-                sub_end = sub_start + sub_segment_duration
+            # Extract word-level timestamps if available
+            words_with_timing = []
+            for segment in whisper_result.get('segments', []):
+                if 'words' in segment:
+                    for word_info in segment['words']:
+                        words_with_timing.append({
+                            'word': word_info['word'].strip(),
+                            'start': word_info['start'],
+                            'end': word_info['end']
+                        })
+                else:
+                    # Fallback to segment-level timing
+                    segment_words = segment['text'].strip().split()
+                    word_duration = (segment['end'] - segment['start']) / len(segment_words) if segment_words else 0
+                    for i, word in enumerate(segment_words):
+                        words_with_timing.append({
+                            'word': word,
+                            'start': segment['start'] + (i * word_duration),
+                            'end': segment['start'] + ((i + 1) * word_duration)
+                        })
+            
+            # Clean up
+            try:
+                os.unlink(json_path)
+                os.rmdir(temp_dir)
+            except:
+                pass
+            
+            return words_with_timing
+            
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.warning("Whisper CLI not found or failed, falling back to Python whisper...")
+        return transcribe_with_python_whisper(audio_path)
+
+def transcribe_with_python_whisper(audio_path: str) -> list:
+    """Fallback transcription using Python whisper library"""
+    logger.info("Transcribing audio with Python whisper library...")
+    
+    try:
+        model = get_whisper_model()
+        result = model.transcribe(audio_path, word_timestamps=True)
+        
+        words_with_timing = []
+        for segment in result.get('segments', []):
+            if 'words' in segment:
+                for word_info in segment['words']:
+                    words_with_timing.append({
+                        'word': word_info['word'].strip(),
+                        'start': word_info['start'],
+                        'end': word_info['end']
+                    })
+            else:
+                # Fallback to segment-level timing
+                segment_words = segment['text'].strip().split()
+                word_duration = (segment['end'] - segment['start']) / len(segment_words) if segment_words else 0
+                for i, word in enumerate(segment_words):
+                    words_with_timing.append({
+                        'word': word,
+                        'start': segment['start'] + (i * word_duration),
+                        'end': segment['start'] + ((i + 1) * word_duration)
+                    })
+        
+        return words_with_timing
+        
+    except Exception as e:
+        logger.error(f"Python whisper transcription failed: {e}")
+        raise
+
+def group_words_into_subtitles(words_with_timing: list, max_words: int) -> list:
+    """Group words into subtitles based on max_words parameter"""
+    if not words_with_timing:
+        return []
+    
+    subtitles = []
+    current_group = []
+    
+    for word_info in words_with_timing:
+        current_group.append(word_info)
+        
+        # Check if we should create a new subtitle
+        if len(current_group) >= max_words:
+            if current_group:
+                subtitle_text = ' '.join([w['word'] for w in current_group])
+                start_time = current_group[0]['start']
+                end_time = current_group[-1]['end']
                 
-                srt_content.append(f"{segment_counter}")
-                srt_content.append(f"{format_timestamp(sub_start)} --> {format_timestamp(sub_end)}")
-                srt_content.append(f"{text_segment.strip()}")
-                srt_content.append("")
-                segment_counter += 1
-        else:
-            srt_content.append(f"{segment_counter}")
-            srt_content.append(f"{start_time} --> {end_time}")
-            text_segment: str = segment['text']
-            srt_content.append(f"{text_segment.strip()}")
-            srt_content.append("")
-            segment_counter += 1
+                subtitles.append({
+                    'text': subtitle_text.strip(),
+                    'start_time': start_time,
+                    'end_time': end_time
+                })
+            
+            current_group = []
+    
+    # Handle remaining words
+    if current_group:
+        subtitle_text = ' '.join([w['word'] for w in current_group])
+        start_time = current_group[0]['start']
+        end_time = current_group[-1]['end']
+        
+        subtitles.append({
+            'text': subtitle_text.strip(),
+            'start_time': start_time,
+            'end_time': end_time
+        })
+    
+    return subtitles
+
+def generate_srt_from_subtitles(subtitles: list) -> str:
+    """Generate SRT content from subtitle segments."""
+    srt_content = []
+    
+    for i, subtitle in enumerate(subtitles, 1):
+        start_time = format_timestamp(subtitle['start_time'])
+        end_time = format_timestamp(subtitle['end_time'])
+        
+        srt_content.append(f"{i}")
+        srt_content.append(f"{start_time} --> {end_time}")
+        srt_content.append(f"{subtitle['text']}")
+        srt_content.append("")
     
     return "\n".join(srt_content)
 
 @app.post("/api/convert")
 async def convert_m4a_to_srt(
     file: UploadFile = File(...),
-    words_per_segment: Optional[int] = Form(0, description="Number of words per subtitle segment (0 for no segmentation)"),
-    frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations")
+    words_per_segment: Optional[int] = Form(8, description="Number of words per subtitle segment (default: 8)"),
+    frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)")
 ):
     logger.info(f"Received conversion request for file: {file.filename}")
     """
-    Convert M4A audio file to SRT subtitle format using OpenAI Whisper.
+    Convert M4A audio file to SRT subtitle format using OpenAI Whisper with word-level timing.
     
     Args:
         file: M4A audio file
-        words_per_segment: Number of words per subtitle segment (0 = no segmentation)
-        frame_rate: Frame rate for timing calculations (default: 30.0)
+        words_per_segment: Number of words per subtitle segment (default: 8)
+        frame_rate: Frame rate for timing calculations (default: 25.0)
     
     Returns:
         SRT file as download
@@ -147,11 +250,14 @@ async def convert_m4a_to_srt(
     if not file.filename.lower().endswith('.m4a'):
         raise HTTPException(status_code=400, detail="File must be in M4A format")
     
-    if words_per_segment < 0:
-        raise HTTPException(status_code=400, detail="Words per segment must be non-negative")
+    if words_per_segment < 1:
+        raise HTTPException(status_code=400, detail="Words per segment must be at least 1")
     
     if frame_rate <= 0:
         raise HTTPException(status_code=400, detail="Frame rate must be positive")
+    
+    temp_m4a_path = None
+    wav_path = None
     
     try:
         logger.info("Creating temporary files...")
@@ -167,15 +273,22 @@ async def convert_m4a_to_srt(
         wav_path = convert_audio_to_wav(temp_m4a_path)
         logger.info(f"WAV file created: {wav_path}")
         
-        # Load Whisper model and transcribe
-        logger.info("Loading Whisper model and transcribing...")
-        model = get_whisper_model()
-        result = model.transcribe(wav_path)
-        logger.info("Transcription completed")
+        # Transcribe audio with word-level timestamps
+        logger.info("Transcribing audio with word-level timestamps...")
+        words_with_timing = transcribe_with_whisper_word_timestamps(wav_path)
+        
+        if not words_with_timing:
+            raise HTTPException(status_code=400, detail="No speech detected in audio file")
+        
+        logger.info(f"Transcription completed with {len(words_with_timing)} words")
+        
+        # Group words into subtitles
+        logger.info(f"Grouping words into subtitles (max {words_per_segment} words per subtitle)...")
+        subtitles = group_words_into_subtitles(words_with_timing, words_per_segment)
         
         # Generate SRT content
         logger.info("Generating SRT content...")
-        srt_content = generate_srt(result["segments"], words_per_segment, frame_rate)
+        srt_content = generate_srt_from_subtitles(subtitles)
         
         # Create temporary SRT file
         logger.info("Creating SRT file...")
@@ -192,6 +305,7 @@ async def convert_m4a_to_srt(
         # Return SRT file
         filename = file.filename.replace(".m4a", ".srt")
         logger.info(f"Returning SRT file: {filename}")
+        logger.info(f"Generated {len(subtitles)} subtitles")
         
         async def cleanup():
             try:
@@ -210,7 +324,7 @@ async def convert_m4a_to_srt(
         logger.error(f"Conversion failed: {str(e)}")
         # Clean up on error
         for path in [temp_m4a_path, wav_path]:
-            if 'path' in locals() and os.path.exists(path):
+            if path and os.path.exists(path):
                 try:
                     os.unlink(path)
                 except OSError:
