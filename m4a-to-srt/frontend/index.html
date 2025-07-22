@@ -311,13 +311,10 @@
 				success.style.display = 'none';
 
 				try {
-					const response = await fetch(
-						'https://m4a-to-srt.onrender.com/api/convert',
-						{
-							method: 'POST',
-							body: formData,
-						}
-					);
+					const response = await fetch('/api/convert', {
+						method: 'POST',
+						body: formData,
+					});
 
 					if (response.ok) {
 						// Download the SRT file
