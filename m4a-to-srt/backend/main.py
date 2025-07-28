@@ -30,14 +30,8 @@ app.add_middleware(
 async def startup_event():
     """Initialize the application on startup."""
     logger.info("Starting M4A to SRT Converter API...")
-    try:
-        # Preload the Whisper model
-        get_whisper_model()
-        logger.info("Application startup completed successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize application: {e}")
-        # Don't raise here to allow the app to start even if model loading fails
-        logger.warning("Continuing without preloaded model")
+    logger.info("Application startup completed successfully")
+    # Note: Whisper model will be loaded on first request to avoid startup timeout
 
 # Global whisper model instance for reuse
 _model = None
@@ -334,20 +328,16 @@ async def convert_m4a_to_srt(
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Serve the frontend interface."""
-    try:
-        with open("../frontend/index.html", "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return HTMLResponse(content="""
-        <html>
-            <head><title>M4A to SRT API</title></head>
-            <body>
-                <h1>M4A to SRT Converter API</h1>
-                <p>API is running. Use POST /api/convert to convert M4A files to SRT.</p>
-                <p>Frontend not found. Please deploy the frontend separately or check the file path.</p>
-            </body>
-        </html>
-        """)
+    return HTMLResponse(content="""
+    <html>
+        <head><title>M4A to SRT API</title></head>
+        <body>
+            <h1>M4A to SRT Converter API</h1>
+            <p>API is running. Use POST /api/convert to convert M4A files to SRT.</p>
+            <p>Frontend not found. Please deploy the frontend separately or check the file path.</p>
+        </body>
+    </html>
+    """)
 
 @app.get("/health")
 async def health():
@@ -374,4 +364,5 @@ async def options_convert():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port) 
+    logger.info(f"Starting server on host 0.0.0.0 port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info") 
