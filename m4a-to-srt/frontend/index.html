@@ -176,6 +176,54 @@
 				margin-top: 15px;
 				font-size: 14px;
 			}
+
+			.notification {
+				padding: 12px;
+				border-radius: 8px;
+				margin-top: 15px;
+				font-size: 14px;
+				border-left: 4px solid;
+				position: relative;
+				display: none;
+			}
+
+			.notification.warning {
+				background: #fff3cd;
+				color: #856404;
+				border-left-color: #ffc107;
+			}
+
+			.notification.info {
+				background: #d1ecf1;
+				color: #0c5460;
+				border-left-color: #17a2b8;
+			}
+
+			.notification.show {
+				display: block;
+				animation: slideIn 0.3s ease;
+			}
+
+			@keyframes slideIn {
+				from {
+					opacity: 0;
+					transform: translateY(-10px);
+				}
+				to {
+					opacity: 1;
+					transform: translateY(0);
+				}
+			}
+
+			.current-request {
+				background: #e2e3e5;
+				color: #495057;
+				padding: 8px 12px;
+				border-radius: 6px;
+				margin-top: 10px;
+				font-size: 12px;
+				border-left: 3px solid #6c757d;
+			}
 		</style>
 	</head>
 	<body>
@@ -233,6 +281,13 @@
 			<div class="error" id="error"></div>
 			<div class="success" id="success"></div>
 
+			<div class="notification warning" id="cancellationNotification"></div>
+			<div
+				class="current-request"
+				id="currentRequest"
+				style="display: none"
+			></div>
+
 			<div class="info">
 				<strong>How it works:</strong><br />
 				1. Upload your M4A audio file<br />
@@ -250,6 +305,44 @@
 			const loading = document.getElementById('loading');
 			const error = document.getElementById('error');
 			const success = document.getElementById('success');
+			const cancellationNotification = document.getElementById(
+				'cancellationNotification'
+			);
+			const currentRequest = document.getElementById('currentRequest');
+
+			// Request tracking
+			let currentRequestId = null;
+
+			// Utility functions
+			function generateRequestId() {
+				return (
+					'req_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+				);
+			}
+
+			function showNotification(element, message, type = '', duration = 5000) {
+				element.textContent = message;
+				element.className = `notification ${type} show`;
+				element.style.display = 'block';
+
+				setTimeout(() => {
+					element.classList.remove('show');
+					setTimeout(() => {
+						element.style.display = 'none';
+					}, 300);
+				}, duration);
+			}
+
+			function showCurrentRequest(filename, requestId) {
+				currentRequest.innerHTML = `<strong>Processing:</strong> ${filename} <small>(${requestId.substr(
+					-8
+				)})</small>`;
+				currentRequest.style.display = 'block';
+			}
+
+			function hideCurrentRequest() {
+				currentRequest.style.display = 'none';
+			}
 
 			// Update file label when file is selected
 			fileInput.addEventListener('change', (e) => {
@@ -300,6 +393,9 @@
 					return;
 				}
 
+				// Generate new request ID
+				currentRequestId = generateRequestId();
+
 				formData.append('file', file);
 				formData.append('words_per_segment', wordsPerSegment);
 				formData.append('frame_rate', frameRate);
@@ -309,6 +405,10 @@
 				loading.style.display = 'block';
 				error.style.display = 'none';
 				success.style.display = 'none';
+				cancellationNotification.style.display = 'none';
+
+				// Show current request info
+				showCurrentRequest(file.name, currentRequestId);
 
 				try {
 					const response = await fetch('/api/convert', {
@@ -316,27 +416,74 @@
 						body: formData,
 					});
 
-					if (response.ok) {
-						// Download the SRT file
-						const blob = await response.blob();
-						const url = window.URL.createObjectURL(blob);
-						const a = document.createElement('a');
-						a.href = url;
-						a.download = file.name.replace('.m4a', '.srt');
-						document.body.appendChild(a);
-						a.click();
-						window.URL.revokeObjectURL(url);
-						document.body.removeChild(a);
+					// Check for cancellation headers
+					const cancelledRequestId = response.headers.get(
+						'X-Cancelled-Request'
+					);
+					const cancelledFilename = response.headers.get(
+						'X-Cancelled-Filename'
+					);
+					const currentRequestIdFromServer =
+						response.headers.get('X-Current-Request');
+					const currentFilenameFromServer =
+						response.headers.get('X-Current-Filename');
 
-						showSuccess('Conversion completed! SRT file downloaded.');
+					if (response.ok) {
+						const contentType = response.headers.get('content-type');
+
+						// Check if response is JSON (cancellation) or file download
+						if (contentType && contentType.includes('application/json')) {
+							// Handle cancellation response
+							const data = await response.json();
+							if (data.status === 'cancelled') {
+								showNotification(
+									cancellationNotification,
+									`Request cancelled: ${data.message}`,
+									'warning',
+									3000
+								);
+								hideCurrentRequest();
+								return;
+							}
+						} else {
+							// Handle successful file download
+							if (cancelledRequestId && cancelledFilename) {
+								showNotification(
+									cancellationNotification,
+									`Previous request cancelled: ${cancelledFilename} (${cancelledRequestId.substr(
+										-8
+									)}). Now processing: ${currentFilenameFromServer} (${currentRequestIdFromServer.substr(
+										-8
+									)})`,
+									'warning',
+									7000
+								);
+							}
+
+							// Download the SRT file
+							const blob = await response.blob();
+							const url = window.URL.createObjectURL(blob);
+							const a = document.createElement('a');
+							a.href = url;
+							a.download = file.name.replace('.m4a', '.srt');
+							document.body.appendChild(a);
+							a.click();
+							window.URL.revokeObjectURL(url);
+							document.body.removeChild(a);
+
+							showSuccess('Conversion completed! SRT file downloaded.');
+							hideCurrentRequest();
+						}
 					} else {
 						const errorData = await response.json();
 						showError(
 							`Conversion failed: ${errorData.detail || 'Unknown error'}`
 						);
+						hideCurrentRequest();
 					}
 				} catch (err) {
 					showError(`Network error: ${err.message}`);
+					hideCurrentRequest();
 				} finally {
 					convertBtn.disabled = false;
 					loading.style.display = 'none';
