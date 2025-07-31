@@ -2,13 +2,13 @@ import os
 import tempfile
 import whisper
 import logging
-from typing import Optional
+import asyncio
+import uuid
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
-import re
 import json
 from datetime import timedelta
 
@@ -36,6 +36,10 @@ async def startup_event():
 # Global whisper model instance for reuse
 _model = None
 
+# Global request tracking
+_current_request: Optional[Dict[str, Any]] = None
+_current_task: Optional[asyncio.Task] = None
+
 def get_whisper_model():
     """Get or initialize the Whisper model singleton."""
     global _model
@@ -49,6 +53,39 @@ def get_whisper_model():
             raise
     return _model
 
+def cancel_current_request():
+    """Cancel the current ongoing request if any."""
+    global _current_request, _current_task
+    if _current_task and not _current_task.done():
+        logger.info(f"Cancelling request: {_current_request['id'] if _current_request else 'unknown'}")
+        _current_task.cancel()
+        return True
+    return False
+
+def register_new_request(request_id: str, filename: str):
+    """Register a new request and cancel any existing one."""
+    global _current_request
+    cancelled_request = None
+    
+    # Cancel current request if exists
+    if _current_request:
+        cancelled_request = _current_request.copy()
+        cancel_current_request()
+    
+    # Register new request
+    _current_request = {
+        "id": request_id,
+        "filename": filename,
+        "status": "processing"
+    }
+    
+    return cancelled_request
+
+async def check_cancellation():
+    """Check if current task should be cancelled."""
+    if asyncio.current_task() and asyncio.current_task().cancelled():
+        raise asyncio.CancelledError("Request was cancelled")
+
 def format_timestamp(seconds: float) -> str:
     """Convert seconds to SRT timestamp format."""
     td = timedelta(seconds=seconds)
@@ -58,39 +95,68 @@ def format_timestamp(seconds: float) -> str:
     millisecs = int((td.total_seconds() % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
 
-def convert_audio_to_wav(audio_path: str) -> str:
+async def convert_audio_to_wav(audio_path: str) -> str:
     """Convert M4A to WAV format for Whisper processing using ffmpeg."""
     wav_path = audio_path.replace(".m4a", ".wav")
     
     try:
+        await check_cancellation()
+        
         # Use ffmpeg to convert M4A to WAV
-        subprocess.run([
+        process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", audio_path, 
             "-acodec", "pcm_s16le", 
             "-ar", "16000", 
             "-ac", "1", 
-            wav_path
-        ], check=True, capture_output=True)
+            wav_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        await check_cancellation()
+        
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg conversion failed: {stderr.decode()}")
+            
         return wav_path
-    except subprocess.CalledProcessError as e:
-        raise Exception(f"FFmpeg conversion failed: {e.stderr.decode()}")
+    except asyncio.CancelledError:
+        # Clean up partial file if exists
+        if os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+        raise
     except FileNotFoundError:
         raise Exception("FFmpeg not found. Please install ffmpeg.")
 
-def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
+async def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
     """Use OpenAI Whisper for transcription with word-level timestamps"""
     logger.info("Transcribing audio with Whisper word-level timestamps...")
     
     try:
+        await check_cancellation()
+        
         # Try to use whisper command line tool with word-level timestamps
         temp_dir = tempfile.mkdtemp()
-        result = subprocess.run([
+        process = await asyncio.create_subprocess_exec(
             'whisper', audio_path, 
             '--model', 'base',
             '--output_format', 'json',
             '--word_timestamps', 'True',
-            '--output_dir', temp_dir
-        ], capture_output=True, text=True, check=True)
+            '--output_dir', temp_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        await check_cancellation()
+        
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, 'whisper')
         
         # Find the output JSON file
         base_name = os.path.splitext(os.path.basename(audio_path))[0]
@@ -99,6 +165,8 @@ def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
         if os.path.exists(json_path):
             with open(json_path, 'r', encoding='utf-8') as f:
                 whisper_result = json.load(f)
+            
+            await check_cancellation()
             
             # Extract word-level timestamps if available
             words_with_timing = []
@@ -130,17 +198,40 @@ def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
             
             return words_with_timing
             
+    except asyncio.CancelledError:
+        # Clean up temp directory if exists
+        try:
+            if 'temp_dir' in locals():
+                for file in os.listdir(temp_dir):
+                    os.unlink(os.path.join(temp_dir, file))
+                os.rmdir(temp_dir)
+        except:
+            pass
+        raise
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning("Whisper CLI not found or failed, falling back to Python whisper...")
-        return transcribe_with_python_whisper(audio_path)
+        return await transcribe_with_python_whisper(audio_path)
 
-def transcribe_with_python_whisper(audio_path: str) -> list:
+async def transcribe_with_python_whisper(audio_path: str) -> list:
     """Fallback transcription using Python whisper library"""
     logger.info("Transcribing audio with Python whisper library...")
     
     try:
+        await check_cancellation()
+        
+        # Run whisper in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
         model = get_whisper_model()
-        result = model.transcribe(audio_path, word_timestamps=True)
+        
+        await check_cancellation()
+        
+        # This is a CPU-intensive operation, so we run it in a thread
+        result = await loop.run_in_executor(
+            None, 
+            lambda: model.transcribe(audio_path, word_timestamps=True)
+        )
+        
+        await check_cancellation()
         
         words_with_timing = []
         for segment in result.get('segments', []):
@@ -164,6 +255,9 @@ def transcribe_with_python_whisper(audio_path: str) -> list:
         
         return words_with_timing
         
+    except asyncio.CancelledError:
+        logger.info("Python whisper transcription cancelled")
+        raise
     except Exception as e:
         logger.error(f"Python whisper transcription failed: {e}")
         raise
@@ -223,58 +317,30 @@ def generate_srt_from_subtitles(subtitles: list) -> str:
     
     return "\n".join(srt_content)
 
-@app.post("/api/convert")
-async def convert_m4a_to_srt(
-    file: UploadFile = File(...),
-    words_per_segment: Optional[int] = Form(8, description="Number of words per subtitle segment (default: 8)"),
-    frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)")
-):
-    logger.info(f"Received conversion request for file: {file.filename}")
-    """
-    Convert M4A audio file to SRT subtitle format using OpenAI Whisper with word-level timing.
-    
-    Args:
-        file: M4A audio file
-        words_per_segment: Number of words per subtitle segment (default: 8)
-        frame_rate: Frame rate for timing calculations (default: 25.0)
-    
-    Returns:
-        SRT file as download
-    """
-    if not file.filename.lower().endswith('.m4a'):
-        raise HTTPException(status_code=400, detail="File must be in M4A format")
-    
-    if words_per_segment < 1:
-        raise HTTPException(status_code=400, detail="Words per segment must be at least 1")
-    
-    if frame_rate <= 0:
-        raise HTTPException(status_code=400, detail="Frame rate must be positive")
-    
-    temp_m4a_path = None
+async def process_conversion_async(
+    temp_m4a_path: str, 
+    words_per_segment: int, 
+    frame_rate: float
+) -> str:
+    """Main async conversion logic that can be cancelled."""
     wav_path = None
     
     try:
-        logger.info("Creating temporary files...")
-        # Create temporary files
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_m4a:
-            content = await file.read()
-            temp_m4a.write(content)
-            temp_m4a_path = temp_m4a.name
-        logger.info(f"Temporary file created: {temp_m4a_path}")
-        
         # Convert M4A to WAV
         logger.info("Converting M4A to WAV...")
-        wav_path = convert_audio_to_wav(temp_m4a_path)
+        wav_path = await convert_audio_to_wav(temp_m4a_path)
         logger.info(f"WAV file created: {wav_path}")
         
         # Transcribe audio with word-level timestamps
         logger.info("Transcribing audio with word-level timestamps...")
-        words_with_timing = transcribe_with_whisper_word_timestamps(wav_path)
+        words_with_timing = await transcribe_with_whisper_word_timestamps(wav_path)
         
         if not words_with_timing:
             raise HTTPException(status_code=400, detail="No speech detected in audio file")
         
         logger.info(f"Transcription completed with {len(words_with_timing)} words")
+        
+        await check_cancellation()
         
         # Group words into subtitles
         logger.info(f"Grouping words into subtitles (max {words_per_segment} words per subtitle)...")
@@ -291,15 +357,100 @@ async def convert_m4a_to_srt(
             temp_srt_path = temp_srt.name
         logger.info(f"SRT file created: {temp_srt_path}")
         
-        # Clean up temporary files
-        logger.info("Cleaning up temporary files...")
-        os.unlink(temp_m4a_path)
-        os.unlink(wav_path)
+        # Clean up WAV file
+        if wav_path and os.path.exists(wav_path):
+            os.unlink(wav_path)
+        
+        logger.info(f"Generated {len(subtitles)} subtitles")
+        return temp_srt_path
+        
+    except asyncio.CancelledError:
+        logger.info("Conversion process cancelled")
+        # Clean up files
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+        raise
+    except Exception as e:
+        # Clean up on error
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+        raise
+
+@app.post("/api/convert")
+async def convert_m4a_to_srt(
+    file: UploadFile = File(...),
+    words_per_segment: Optional[int] = Form(8, description="Number of words per subtitle segment (default: 8)"),
+    frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)")
+):
+    global _current_task, _current_request
+    
+    # Generate unique request ID
+    request_id = str(uuid.uuid4())
+    logger.info(f"Received conversion request {request_id} for file: {file.filename}")
+    
+    """
+    Convert M4A audio file to SRT subtitle format using OpenAI Whisper with word-level timing.
+    Cancels any previous ongoing request.
+    
+    Args:
+        file: M4A audio file
+        words_per_segment: Number of words per subtitle segment (default: 8)
+        frame_rate: Frame rate for timing calculations (default: 30.0)
+    
+    Returns:
+        SRT file as download or cancellation info
+    """
+    if not file.filename.lower().endswith('.m4a'):
+        raise HTTPException(status_code=400, detail="File must be in M4A format")
+    
+    if words_per_segment < 1:
+        raise HTTPException(status_code=400, detail="Words per segment must be at least 1")
+    
+    if frame_rate <= 0:
+        raise HTTPException(status_code=400, detail="Frame rate must be positive")
+    
+    # Register new request and handle cancellation
+    cancelled_request = register_new_request(request_id, file.filename)
+    
+    temp_m4a_path = None
+    
+    try:
+        logger.info(f"Request {request_id}: Creating temporary files...")
+        
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_m4a:
+            content = await file.read()
+            temp_m4a.write(content)
+            temp_m4a_path = temp_m4a.name
+        logger.info(f"Request {request_id}: Temporary file created: {temp_m4a_path}")
+        
+        # Create and store the processing task
+        async def conversion_task():
+            return await process_conversion_async(temp_m4a_path, words_per_segment, frame_rate)
+        
+        _current_task = asyncio.create_task(conversion_task())
+        
+        # Wait for the conversion to complete
+        temp_srt_path = await _current_task
+        
+        # Clean up M4A file
+        logger.info(f"Request {request_id}: Cleaning up temporary files...")
+        if temp_m4a_path and os.path.exists(temp_m4a_path):
+            os.unlink(temp_m4a_path)
+        
+        # Mark request as completed
+        if _current_request and _current_request["id"] == request_id:
+            _current_request["status"] = "completed"
         
         # Return SRT file
         filename = file.filename.replace(".m4a", ".srt")
-        logger.info(f"Returning SRT file: {filename}")
-        logger.info(f"Generated {len(subtitles)} subtitles")
+        logger.info(f"Request {request_id}: Returning SRT file: {filename}")
         
         async def cleanup():
             try:
@@ -307,23 +458,63 @@ async def convert_m4a_to_srt(
             except OSError:
                 pass  # File might already be deleted
         
+        # Prepare response with cancellation info if applicable
+        headers = {}
+        if cancelled_request:
+            headers["X-Cancelled-Request"] = cancelled_request["id"]
+            headers["X-Cancelled-Filename"] = cancelled_request["filename"]
+            headers["X-Current-Request"] = request_id
+            headers["X-Current-Filename"] = file.filename
+            logger.info(f"Request {request_id}: Cancelled previous request {cancelled_request['id']} ({cancelled_request['filename']})")
+        
         return FileResponse(
             temp_srt_path,
             media_type="application/x-subrip",
             filename=filename,
-            background=cleanup
+            background=cleanup,
+            headers=headers
+        )
+        
+    except asyncio.CancelledError:
+        logger.info(f"Request {request_id}: Conversion was cancelled")
+        # Clean up files
+        if temp_m4a_path and os.path.exists(temp_m4a_path):
+            try:
+                os.unlink(temp_m4a_path)
+            except OSError:
+                pass
+        
+        # Return cancellation response
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "cancelled",
+                "request_id": request_id,
+                "message": f"Request {request_id} for '{file.filename}' was cancelled"
+            }
         )
         
     except Exception as e:
-        logger.error(f"Conversion failed: {str(e)}")
+        logger.error(f"Request {request_id}: Conversion failed: {str(e)}")
+        
         # Clean up on error
-        for path in [temp_m4a_path, wav_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        if temp_m4a_path and os.path.exists(temp_m4a_path):
+            try:
+                os.unlink(temp_m4a_path)
+            except OSError:
+                pass
+        
+        # Clear current request on error
+        if _current_request and _current_request["id"] == request_id:
+            _current_request = None
+            _current_task = None
+        
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    
+    finally:
+        # Clean up task reference if this was the current task
+        if _current_task and _current_task.done():
+            _current_task = None
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
