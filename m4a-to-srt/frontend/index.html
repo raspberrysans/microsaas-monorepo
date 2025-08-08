@@ -411,7 +411,7 @@
 				showCurrentRequest(file.name, currentRequestId);
 
 				try {
-					const response = await fetch('/api/convert', {
+					const response = await fetch('http://localhost:8000/api/convert', {
 						method: 'POST',
 						body: formData,
 					});
