@@ -23,11 +23,22 @@ This is typically sufficient for personal or small-scale usage.
 
 ## Step 1: Setup Google Cloud Project
 
+**Set your project ID as an environment variable** (replace with your actual project ID):
+
+```bash
+export PROJECT_ID="your-project-id-here"
+# Example for project "august-mantra-468701-i7":
+# export PROJECT_ID="august-mantra-468701-i7"
+```
+
 1. **Create a new project** (or use existing):
 
    ```bash
-   gcloud projects create m4a-to-srt-converter --name="M4A to SRT Converter"
-   gcloud config set project m4a-to-srt-converter
+   # For new project (optional - skip if using existing project)
+   gcloud projects create $PROJECT_ID --name="M4A to SRT Converter"
+
+   # Set the active project
+   gcloud config set project $PROJECT_ID
    ```
 
 2. **Enable required APIs**:
@@ -54,12 +65,12 @@ This is typically sufficient for personal or small-scale usage.
 2. **Build and push the Docker image**:
 
    ```bash
-   # Build the image
-   gcloud builds submit --tag gcr.io/m4a-to-srt-converter/m4a-to-srt:latest .
+   # Build the image using Cloud Build (recommended)
+   gcloud builds submit --tag gcr.io/$PROJECT_ID/m4a-to-srt:latest .
 
    # Or build locally and push
-   docker build -t gcr.io/m4a-to-srt-converter/m4a-to-srt:latest .
-   docker push gcr.io/m4a-to-srt-converter/m4a-to-srt:latest
+   docker build -t gcr.io/$PROJECT_ID/m4a-to-srt:latest .
+   docker push gcr.io/$PROJECT_ID/m4a-to-srt:latest
    ```
 
 ## Step 3: Deploy to Cloud Run
@@ -68,7 +79,7 @@ This is typically sufficient for personal or small-scale usage.
 
    ```bash
    gcloud run deploy m4a-to-srt-service \
-     --image gcr.io/m4a-to-srt-converter/m4a-to-srt:latest \
+     --image gcr.io/$PROJECT_ID/m4a-to-srt:latest \
      --platform managed \
      --region us-central1 \
      --allow-unauthenticated \
@@ -186,7 +197,7 @@ To stay within the free tier:
    ```bash
    gcloud billing budgets create --billing-account=YOUR_BILLING_ACCOUNT \
      --budget-amount=0.00USD \
-     --budget-filter-projects=projects/m4a-to-srt-converter
+     --budget-filter-projects=projects/$PROJECT_ID
    ```
 
 2. **Set up alerts**:
@@ -247,12 +258,12 @@ To avoid charges when not using the service:
 2. **Delete the container image**:
 
    ```bash
-   gcloud container images delete gcr.io/m4a-to-srt-converter/m4a-to-srt:latest
+   gcloud container images delete gcr.io/$PROJECT_ID/m4a-to-srt:latest
    ```
 
 3. **Delete the project** (optional):
    ```bash
-   gcloud projects delete m4a-to-srt-converter
+   gcloud projects delete $PROJECT_ID
    ```
 
 ## Security Considerations
