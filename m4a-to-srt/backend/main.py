@@ -5,12 +5,18 @@ import logging
 import asyncio
 import uuid
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import json
 from datetime import timedelta
+from dotenv import load_dotenv
+from firebase_config import initialize_firebase, increment_user_usage
+from auth_middleware import require_conversion_access, get_user_with_permissions
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +36,15 @@ app.add_middleware(
 async def startup_event():
     """Initialize the application on startup."""
     logger.info("Starting M4A to SRT Converter API...")
+    
+    # Initialize Firebase Admin SDK
+    try:
+        initialize_firebase()
+        logger.info("Firebase initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Firebase: {e}")
+        # Don't fail startup, but log the error
+    
     logger.info("Application startup completed successfully")
     # Note: Whisper model will be loaded on first request to avoid startup timeout
 
@@ -386,13 +401,18 @@ async def process_conversion_async(
 async def convert_m4a_to_srt(
     file: UploadFile = File(...),
     words_per_segment: Optional[int] = Form(8, description="Number of words per subtitle segment (default: 8)"),
-    frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)")
+    frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)"),
+    user_permissions: dict = Depends(require_conversion_access)
 ):
     global _current_task, _current_request
     
     # Generate unique request ID
     request_id = str(uuid.uuid4())
-    logger.info(f"Received conversion request {request_id} for file: {file.filename}")
+    uid = user_permissions['uid']
+    email = user_permissions['email']
+    is_admin = user_permissions['is_admin']
+    
+    logger.info(f"Received conversion request {request_id} for file: {file.filename} from user: {email} (Admin: {is_admin})")
     
     """
     Convert M4A audio file to SRT subtitle format using OpenAI Whisper with word-level timing.
@@ -447,6 +467,15 @@ async def convert_m4a_to_srt(
         # Mark request as completed
         if _current_request and _current_request["id"] == request_id:
             _current_request["status"] = "completed"
+        
+        # Increment user usage (only for non-admin users)
+        if not is_admin:
+            try:
+                await increment_user_usage(uid)
+                logger.info(f"Request {request_id}: Incremented usage for user {email}")
+            except Exception as e:
+                logger.error(f"Request {request_id}: Failed to increment usage: {e}")
+                # Don't fail the request if usage increment fails
         
         # Return SRT file
         filename = file.filename.replace(".m4a", ".srt")
@@ -541,6 +570,21 @@ async def test():
     """Simple test endpoint."""
     logger.info("Test endpoint called")
     return {"message": "API is working", "timestamp": "2024-01-01"}
+
+@app.get("/api/user/status")
+async def get_user_status(user_permissions: dict = Depends(get_user_with_permissions)):
+    """Get current user status and usage information"""
+    user_data = user_permissions['user_data']
+    max_free_conversions = 999999 if user_permissions['is_admin'] else 2
+    
+    return {
+        "email": user_permissions['email'],
+        "isAdmin": user_permissions['is_admin'],
+        "conversionsUsed": user_data.get('conversionsUsed', 0),
+        "maxFreeConversions": max_free_conversions,
+        "canConvert": user_permissions['can_convert'],
+        "remainingConversions": max_free_conversions - user_data.get('conversionsUsed', 0) if not user_permissions['is_admin'] else 999999
+    }
 
 @app.options("/api/convert")
 async def options_convert():
