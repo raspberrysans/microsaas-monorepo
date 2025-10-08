@@ -6,13 +6,16 @@ import { useState, useCallback } from 'react';
 import { FileUploader } from '@/components/FileUploader';
 import { ConversionSettings } from '@/components/ConversionSettings';
 import { ConversionResult } from '@/components/ConversionResult';
+import { SrtPreview } from '@/components/SrtPreview';
 
 interface ConversionState {
-	status: 'idle' | 'uploading' | 'converting' | 'success' | 'error';
+	status: 'idle' | 'uploading' | 'converting' | 'success' | 'preview' | 'error';
 	progress?: number;
 	error?: string;
 	downloadUrl?: string;
 	filename?: string;
+	srtContent?: string;
+	downloadToken?: string;
 }
 
 export default function Home() {
@@ -22,8 +25,9 @@ export default function Home() {
 	});
 
 	const [settings, setSettings] = useState({
-		wordsPerSegment: 1,
+		wordsPerSegment: 8,
 		frameRate: 30.0,
+		useNaturalSegmentation: false,
 	});
 
 	const handleFileSelect = useCallback((selectedFile: File) => {
@@ -41,12 +45,15 @@ export default function Home() {
 			formData.append('file', file);
 			formData.append('words_per_segment', settings.wordsPerSegment.toString());
 			formData.append('frame_rate', settings.frameRate.toString());
+			formData.append(
+				'use_natural_segmentation',
+				settings.useNaturalSegmentation.toString()
+			);
 
 			setConversionState({ status: 'converting', progress: 50 });
 
 			// You can change this URL to your actual backend URL
-			const backendUrl =
-				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+			const backendUrl = 'http://localhost:8000';
 
 			const response = await fetch(`${backendUrl}/api/convert`, {
 				method: 'POST',
@@ -60,35 +67,24 @@ export default function Home() {
 				throw new Error(errorData.detail || `HTTP ${response.status}`);
 			}
 
-			// Check if the response is JSON (cancellation) or file download
-			const contentType = response.headers.get('content-type');
-			if (contentType && contentType.includes('application/json')) {
-				const result = await response.json();
-				if (result.status === 'cancelled') {
-					throw new Error('Conversion was cancelled by a newer request');
-				}
+			// Parse JSON response
+			const result = await response.json();
+
+			if (result.status === 'cancelled') {
+				throw new Error('Conversion was cancelled by a newer request');
 			}
 
-			// Create blob from response for download
-			const blob = await response.blob();
-			const downloadUrl = URL.createObjectURL(blob);
-
-			// Get filename from response headers or generate one
-			const contentDisposition = response.headers.get('content-disposition');
-			let filename = file.name.replace('.m4a', '.srt');
-			if (contentDisposition) {
-				const filenameMatch = contentDisposition.match(/filename="(.+)"/);
-				if (filenameMatch) {
-					filename = filenameMatch[1];
-				}
+			if (result.status === 'success') {
+				setConversionState({
+					status: 'preview',
+					progress: 100,
+					filename: result.filename,
+					srtContent: result.srt_content,
+					downloadToken: result.download_token,
+				});
+			} else {
+				throw new Error('Unexpected response format');
 			}
-
-			setConversionState({
-				status: 'success',
-				progress: 100,
-				downloadUrl,
-				filename,
-			});
 		} catch (error) {
 			console.error('Conversion error:', error);
 			setConversionState({
@@ -100,6 +96,49 @@ export default function Home() {
 			});
 		}
 	}, [file, settings]);
+
+	const handleDownload = useCallback(async () => {
+		if (!conversionState.downloadToken) return;
+
+		try {
+			const backendUrl =
+				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+
+			const response = await fetch(
+				`${backendUrl}/api/download/${conversionState.downloadToken}`,
+				{
+					method: 'GET',
+				}
+			);
+
+			if (!response.ok) {
+				throw new Error('Download failed');
+			}
+
+			// Create blob from response for download
+			const blob = await response.blob();
+			const downloadUrl = URL.createObjectURL(blob);
+
+			// Trigger download
+			const link = document.createElement('a');
+			link.href = downloadUrl;
+			link.download = conversionState.filename || 'converted.srt';
+			document.body.appendChild(link);
+			link.click();
+			document.body.removeChild(link);
+			URL.revokeObjectURL(downloadUrl);
+
+			// Update state to show success
+			setConversionState((prev) => ({ ...prev, status: 'success' }));
+		} catch (error) {
+			console.error('Download error:', error);
+			setConversionState((prev) => ({
+				...prev,
+				status: 'error',
+				error: 'Failed to download file',
+			}));
+		}
+	}, [conversionState.downloadToken, conversionState.filename]);
 
 	const handleReset = useCallback(() => {
 		setFile(null);
@@ -194,6 +233,14 @@ export default function Home() {
 									</div>
 								)}
 							</>
+						) : conversionState.status === 'preview' &&
+						  conversionState.srtContent ? (
+							<SrtPreview
+								srtContent={conversionState.srtContent}
+								filename={conversionState.filename || 'converted.srt'}
+								onDownload={handleDownload}
+								onReset={handleReset}
+							/>
 						) : (
 							<ConversionResult
 								state={conversionState}
