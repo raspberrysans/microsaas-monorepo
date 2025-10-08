@@ -5,15 +5,13 @@ import logging
 import asyncio
 import uuid
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import json
 from datetime import timedelta
 from dotenv import load_dotenv
-from firebase_config import initialize_firebase, increment_user_usage
-from auth_middleware import require_conversion_access, get_user_with_permissions
 
 # Load environment variables
 load_dotenv()
@@ -36,15 +34,6 @@ app.add_middleware(
 async def startup_event():
     """Initialize the application on startup."""
     logger.info("Starting M4A to SRT Converter API...")
-    
-    # Initialize Firebase Admin SDK
-    try:
-        initialize_firebase()
-        logger.info("Firebase initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize Firebase: {e}")
-        # Don't fail startup, but log the error
-    
     logger.info("Application startup completed successfully")
     # Note: Whisper model will be loaded on first request to avoid startup timeout
 
@@ -147,7 +136,7 @@ async def convert_audio_to_wav(audio_path: str) -> str:
     except FileNotFoundError:
         raise Exception("FFmpeg not found. Please install ffmpeg.")
 
-async def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
+async def transcribe_with_whisper_word_timestamps(audio_path: str) -> tuple[list, dict]:
     """Use OpenAI Whisper for transcription with word-level timestamps"""
     logger.info("Transcribing audio with Whisper word-level timestamps...")
     
@@ -211,7 +200,7 @@ async def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
             except:
                 pass
             
-            return words_with_timing
+            return words_with_timing, whisper_result
             
     except asyncio.CancelledError:
         # Clean up temp directory if exists
@@ -227,7 +216,7 @@ async def transcribe_with_whisper_word_timestamps(audio_path: str) -> list:
         logger.warning("Whisper CLI not found or failed, falling back to Python whisper...")
         return await transcribe_with_python_whisper(audio_path)
 
-async def transcribe_with_python_whisper(audio_path: str) -> list:
+async def transcribe_with_python_whisper(audio_path: str) -> tuple[list, dict]:
     """Fallback transcription using Python whisper library"""
     logger.info("Transcribing audio with Python whisper library...")
     
@@ -268,7 +257,7 @@ async def transcribe_with_python_whisper(audio_path: str) -> list:
                         'end': segment['start'] + ((i + 1) * word_duration)
                     })
         
-        return words_with_timing
+        return words_with_timing, result
         
     except asyncio.CancelledError:
         logger.info("Python whisper transcription cancelled")
@@ -317,6 +306,19 @@ def group_words_into_subtitles(words_with_timing: list, max_words: int) -> list:
     
     return subtitles
 
+def use_natural_segments(whisper_result: dict) -> list:
+    """Use Whisper's natural segments instead of word-based grouping"""
+    subtitles = []
+    
+    for segment in whisper_result.get('segments', []):
+        subtitles.append({
+            'text': segment['text'].strip(),
+            'start_time': segment['start'],
+            'end_time': segment['end']
+        })
+    
+    return subtitles
+
 def generate_srt_from_subtitles(subtitles: list) -> str:
     """Generate SRT content from subtitle segments."""
     srt_content = []
@@ -334,9 +336,10 @@ def generate_srt_from_subtitles(subtitles: list) -> str:
 
 async def process_conversion_async(
     temp_m4a_path: str, 
-    words_per_segment: int, 
-    frame_rate: float
-) -> str:
+    words_per_segment: Optional[int], 
+    frame_rate: float,
+    use_natural_segmentation: bool = False
+) -> tuple[str, str]:
     """Main async conversion logic that can be cancelled."""
     wav_path = None
     
@@ -348,18 +351,23 @@ async def process_conversion_async(
         
         # Transcribe audio with word-level timestamps
         logger.info("Transcribing audio with word-level timestamps...")
-        words_with_timing = await transcribe_with_whisper_word_timestamps(wav_path)
+        words_with_timing, whisper_result = await transcribe_with_whisper_word_timestamps(wav_path)
         
-        if not words_with_timing:
+        if not words_with_timing and not whisper_result.get('segments'):
             raise HTTPException(status_code=400, detail="No speech detected in audio file")
         
         logger.info(f"Transcription completed with {len(words_with_timing)} words")
         
         await check_cancellation()
         
-        # Group words into subtitles
-        logger.info(f"Grouping words into subtitles (max {words_per_segment} words per subtitle)...")
-        subtitles = group_words_into_subtitles(words_with_timing, words_per_segment)
+        # Choose segmentation method
+        if use_natural_segmentation:
+            logger.info("Using Whisper's natural segmentation...")
+            subtitles = use_natural_segments(whisper_result)
+        else:
+            # Group words into subtitles
+            logger.info(f"Grouping words into subtitles (max {words_per_segment} words per subtitle)...")
+            subtitles = group_words_into_subtitles(words_with_timing, words_per_segment)
         
         # Generate SRT content
         logger.info("Generating SRT content...")
@@ -377,7 +385,7 @@ async def process_conversion_async(
             os.unlink(wav_path)
         
         logger.info(f"Generated {len(subtitles)} subtitles")
-        return temp_srt_path
+        return srt_content, temp_srt_path
         
     except asyncio.CancelledError:
         logger.info("Conversion process cancelled")
@@ -402,17 +410,14 @@ async def convert_m4a_to_srt(
     file: UploadFile = File(...),
     words_per_segment: Optional[int] = Form(8, description="Number of words per subtitle segment (default: 8)"),
     frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)"),
-    user_permissions: dict = Depends(require_conversion_access)
+    use_natural_segmentation: Optional[bool] = Form(False, description="Use Whisper's natural segmentation instead of word-based grouping")
 ):
     global _current_task, _current_request
     
     # Generate unique request ID
     request_id = str(uuid.uuid4())
-    uid = user_permissions['uid']
-    email = user_permissions['email']
-    is_admin = user_permissions['is_admin']
     
-    logger.info(f"Received conversion request {request_id} for file: {file.filename} from user: {email} (Admin: {is_admin})")
+    logger.info(f"Received conversion request {request_id} for file: {file.filename}")
     
     """
     Convert M4A audio file to SRT subtitle format using OpenAI Whisper with word-level timing.
@@ -429,7 +434,7 @@ async def convert_m4a_to_srt(
     if not file.filename.lower().endswith('.m4a'):
         raise HTTPException(status_code=400, detail="File must be in M4A format")
     
-    if words_per_segment < 1:
+    if not use_natural_segmentation and words_per_segment < 1:
         raise HTTPException(status_code=400, detail="Words per segment must be at least 1")
     
     if frame_rate <= 0:
@@ -452,12 +457,12 @@ async def convert_m4a_to_srt(
         
         # Create and store the processing task
         async def conversion_task():
-            return await process_conversion_async(temp_m4a_path, words_per_segment, frame_rate)
+            return await process_conversion_async(temp_m4a_path, words_per_segment, frame_rate, use_natural_segmentation)
         
         _current_task = asyncio.create_task(conversion_task())
         
         # Wait for the conversion to complete
-        temp_srt_path = await _current_task
+        srt_content, temp_srt_path = await _current_task
         
         # Clean up M4A file
         logger.info(f"Request {request_id}: Cleaning up temporary files...")
@@ -468,41 +473,32 @@ async def convert_m4a_to_srt(
         if _current_request and _current_request["id"] == request_id:
             _current_request["status"] = "completed"
         
-        # Increment user usage (only for non-admin users)
-        if not is_admin:
-            try:
-                await increment_user_usage(uid)
-                logger.info(f"Request {request_id}: Incremented usage for user {email}")
-            except Exception as e:
-                logger.error(f"Request {request_id}: Failed to increment usage: {e}")
-                # Don't fail the request if usage increment fails
-        
-        # Return SRT file
+        # Return SRT content and download info
         filename = file.filename.replace(".m4a", ".srt")
-        logger.info(f"Request {request_id}: Returning SRT file: {filename}")
-        
-        async def cleanup():
-            try:
-                os.unlink(temp_srt_path)
-            except OSError:
-                pass  # File might already be deleted
+        logger.info(f"Request {request_id}: Returning SRT content and download info: {filename}")
         
         # Prepare response with cancellation info if applicable
-        headers = {}
+        response_data = {
+            "status": "success",
+            "request_id": request_id,
+            "filename": filename,
+            "srt_content": srt_content,
+            "download_token": request_id  # Use request_id as download token
+        }
+        
         if cancelled_request:
-            headers["X-Cancelled-Request"] = cancelled_request["id"]
-            headers["X-Cancelled-Filename"] = cancelled_request["filename"]
-            headers["X-Current-Request"] = request_id
-            headers["X-Current-Filename"] = file.filename
+            response_data["cancelled_request"] = {
+                "id": cancelled_request["id"],
+                "filename": cancelled_request["filename"]
+            }
             logger.info(f"Request {request_id}: Cancelled previous request {cancelled_request['id']} ({cancelled_request['filename']})")
         
-        return FileResponse(
-            temp_srt_path,
-            media_type="application/x-subrip",
-            filename=filename,
-            background=cleanup,
-            headers=headers
-        )
+        # Store the temp file path for download endpoint
+        if not hasattr(app.state, 'temp_files'):
+            app.state.temp_files = {}
+        app.state.temp_files[request_id] = temp_srt_path
+        
+        return JSONResponse(content=response_data)
         
     except asyncio.CancelledError:
         logger.info(f"Request {request_id}: Conversion was cancelled")
@@ -571,20 +567,36 @@ async def test():
     logger.info("Test endpoint called")
     return {"message": "API is working", "timestamp": "2024-01-01"}
 
-@app.get("/api/user/status")
-async def get_user_status(user_permissions: dict = Depends(get_user_with_permissions)):
-    """Get current user status and usage information"""
-    user_data = user_permissions['user_data']
-    max_free_conversions = 999999 if user_permissions['is_admin'] else 2
+@app.get("/api/download/{download_token}")
+async def download_srt_file(download_token: str):
+    """Download the SRT file using the download token"""
+    if not hasattr(app.state, 'temp_files') or download_token not in app.state.temp_files:
+        raise HTTPException(status_code=404, detail="Download token not found or expired")
     
-    return {
-        "email": user_permissions['email'],
-        "isAdmin": user_permissions['is_admin'],
-        "conversionsUsed": user_data.get('conversionsUsed', 0),
-        "maxFreeConversions": max_free_conversions,
-        "canConvert": user_permissions['can_convert'],
-        "remainingConversions": max_free_conversions - user_data.get('conversionsUsed', 0) if not user_permissions['is_admin'] else 999999
-    }
+    temp_srt_path = app.state.temp_files[download_token]
+    
+    if not os.path.exists(temp_srt_path):
+        # Clean up the expired token
+        del app.state.temp_files[download_token]
+        raise HTTPException(status_code=404, detail="File not found or expired")
+    
+    # Generate filename from the token (you might want to store this differently)
+    filename = f"converted_{download_token[:8]}.srt"
+    
+    async def cleanup():
+        try:
+            os.unlink(temp_srt_path)
+            if hasattr(app.state, 'temp_files') and download_token in app.state.temp_files:
+                del app.state.temp_files[download_token]
+        except OSError:
+            pass  # File might already be deleted
+    
+    return FileResponse(
+        temp_srt_path,
+        media_type="application/x-subrip",
+        filename=filename,
+        background=cleanup
+    )
 
 @app.options("/api/convert")
 async def options_convert():
