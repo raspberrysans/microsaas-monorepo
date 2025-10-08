@@ -5,7 +5,7 @@
 import { useCallback } from 'react';
 
 interface ConversionState {
-	status: 'idle' | 'uploading' | 'converting' | 'success' | 'error';
+	status: 'idle' | 'uploading' | 'converting' | 'success' | 'preview' | 'error';
 	progress?: number;
 	error?: string;
 	downloadUrl?: string;

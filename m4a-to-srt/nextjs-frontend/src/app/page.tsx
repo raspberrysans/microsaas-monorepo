@@ -6,30 +6,28 @@ import { useState, useCallback } from 'react';
 import { FileUploader } from '@/components/FileUploader';
 import { ConversionSettings } from '@/components/ConversionSettings';
 import { ConversionResult } from '@/components/ConversionResult';
-import { AuthModal } from '@/components/AuthModal';
-import { UsageStatus } from '@/components/UsageStatus';
-import { useAuth } from '@/contexts/AuthContext';
+import { SrtPreview } from '@/components/SrtPreview';
 
 interface ConversionState {
-	status: 'idle' | 'uploading' | 'converting' | 'success' | 'error';
+	status: 'idle' | 'uploading' | 'converting' | 'success' | 'preview' | 'error';
 	progress?: number;
 	error?: string;
 	downloadUrl?: string;
 	filename?: string;
+	srtContent?: string;
+	downloadToken?: string;
 }
 
 export default function Home() {
-	const { user, userData, loading, canUseService, incrementUsage, logout } =
-		useAuth();
 	const [file, setFile] = useState<File | null>(null);
 	const [conversionState, setConversionState] = useState<ConversionState>({
 		status: 'idle',
 	});
-	const [showAuthModal, setShowAuthModal] = useState(false);
 
 	const [settings, setSettings] = useState({
-		wordsPerSegment: 1,
+		wordsPerSegment: 8,
 		frameRate: 30.0,
+		useNaturalSegmentation: false,
 	});
 
 	const handleFileSelect = useCallback((selectedFile: File) => {
@@ -40,22 +38,6 @@ export default function Home() {
 	const handleConvert = useCallback(async () => {
 		if (!file) return;
 
-		// Check if user is authenticated
-		if (!user) {
-			setShowAuthModal(true);
-			return;
-		}
-
-		// Check if user can use the service
-		if (!canUseService()) {
-			setConversionState({
-				status: 'error',
-				error:
-					'You have reached your free conversion limit. Please upgrade to continue.',
-			});
-			return;
-		}
-
 		setConversionState({ status: 'uploading', progress: 0 });
 
 		try {
@@ -63,21 +45,18 @@ export default function Home() {
 			formData.append('file', file);
 			formData.append('words_per_segment', settings.wordsPerSegment.toString());
 			formData.append('frame_rate', settings.frameRate.toString());
+			formData.append(
+				'use_natural_segmentation',
+				settings.useNaturalSegmentation.toString()
+			);
 
 			setConversionState({ status: 'converting', progress: 50 });
 
 			// You can change this URL to your actual backend URL
-			const backendUrl =
-				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-
-			// Get user token for authentication
-			const token = await user.getIdToken();
+			const backendUrl = 'http://localhost:8000';
 
 			const response = await fetch(`${backendUrl}/api/convert`, {
 				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${token}`,
-				},
 				body: formData,
 			});
 
@@ -88,38 +67,24 @@ export default function Home() {
 				throw new Error(errorData.detail || `HTTP ${response.status}`);
 			}
 
-			// Check if the response is JSON (cancellation) or file download
-			const contentType = response.headers.get('content-type');
-			if (contentType && contentType.includes('application/json')) {
-				const result = await response.json();
-				if (result.status === 'cancelled') {
-					throw new Error('Conversion was cancelled by a newer request');
-				}
+			// Parse JSON response
+			const result = await response.json();
+
+			if (result.status === 'cancelled') {
+				throw new Error('Conversion was cancelled by a newer request');
 			}
 
-			// Create blob from response for download
-			const blob = await response.blob();
-			const downloadUrl = URL.createObjectURL(blob);
-
-			// Get filename from response headers or generate one
-			const contentDisposition = response.headers.get('content-disposition');
-			let filename = file.name.replace('.m4a', '.srt');
-			if (contentDisposition) {
-				const filenameMatch = contentDisposition.match(/filename="(.+)"/);
-				if (filenameMatch) {
-					filename = filenameMatch[1];
-				}
+			if (result.status === 'success') {
+				setConversionState({
+					status: 'preview',
+					progress: 100,
+					filename: result.filename,
+					srtContent: result.srt_content,
+					downloadToken: result.download_token,
+				});
+			} else {
+				throw new Error('Unexpected response format');
 			}
-
-			setConversionState({
-				status: 'success',
-				progress: 100,
-				downloadUrl,
-				filename,
-			});
-
-			// Increment usage count
-			await incrementUsage();
 		} catch (error) {
 			console.error('Conversion error:', error);
 			setConversionState({
@@ -130,7 +95,50 @@ export default function Home() {
 						: 'An unexpected error occurred',
 			});
 		}
-	}, [file, settings, user, canUseService, incrementUsage]);
+	}, [file, settings]);
+
+	const handleDownload = useCallback(async () => {
+		if (!conversionState.downloadToken) return;
+
+		try {
+			const backendUrl =
+				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+
+			const response = await fetch(
+				`${backendUrl}/api/download/${conversionState.downloadToken}`,
+				{
+					method: 'GET',
+				}
+			);
+
+			if (!response.ok) {
+				throw new Error('Download failed');
+			}
+
+			// Create blob from response for download
+			const blob = await response.blob();
+			const downloadUrl = URL.createObjectURL(blob);
+
+			// Trigger download
+			const link = document.createElement('a');
+			link.href = downloadUrl;
+			link.download = conversionState.filename || 'converted.srt';
+			document.body.appendChild(link);
+			link.click();
+			document.body.removeChild(link);
+			URL.revokeObjectURL(downloadUrl);
+
+			// Update state to show success
+			setConversionState((prev) => ({ ...prev, status: 'success' }));
+		} catch (error) {
+			console.error('Download error:', error);
+			setConversionState((prev) => ({
+				...prev,
+				status: 'error',
+				error: 'Failed to download file',
+			}));
+		}
+	}, [conversionState.downloadToken, conversionState.filename]);
 
 	const handleReset = useCallback(() => {
 		setFile(null);
@@ -144,66 +152,23 @@ export default function Home() {
 		conversionState.status === 'uploading' ||
 		conversionState.status === 'converting';
 
-	if (loading) {
-		return (
-			<div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center">
-				<div className="text-center">
-					<div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
-					<p className="mt-4 text-gray-600 dark:text-gray-300">Loading...</p>
-				</div>
-			</div>
-		);
-	}
-
 	return (
 		<div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800">
 			<div className="container mx-auto px-4 py-8">
 				<div className="max-w-4xl mx-auto">
 					{/* Header */}
 					<div className="text-center mb-8">
-						<div className="flex justify-between items-center mb-4">
-							<div className="flex-1"></div>
-							<h1 className="text-4xl font-bold text-gray-900 dark:text-white">
-								M4A to SRT Converter
-							</h1>
-							<div className="flex-1 flex justify-end">
-								{user ? (
-									<div className="flex items-center gap-4">
-										<span className="text-sm text-gray-600 dark:text-gray-300">
-											{userData?.isAdmin ? '👑 Admin' : `👋 ${user.email}`}
-										</span>
-										<button
-											onClick={logout}
-											className="text-sm text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
-										>
-											Sign Out
-										</button>
-									</div>
-								) : (
-									<button
-										onClick={() => setShowAuthModal(true)}
-										className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition-colors duration-200"
-									>
-										Sign In
-									</button>
-								)}
-							</div>
-						</div>
+						<h1 className="text-4xl font-bold text-gray-900 dark:text-white mb-4">
+							M4A to SRT Converter
+						</h1>
 						<p className="text-lg text-gray-600 dark:text-gray-300">
 							Convert your M4A audio files to SRT subtitle files using AI
 							transcription
 						</p>
 					</div>
 
-					{/* Usage Status */}
-					{user && <UsageStatus />}
-
 					{/* Main Content */}
-					<div
-						className={`bg-white dark:bg-gray-800 rounded-lg shadow-xl p-8 ${
-							user ? 'mt-6' : ''
-						}`}
-					>
+					<div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-8">
 						{conversionState.status === 'idle' ||
 						conversionState.status === 'error' ? (
 							<>
@@ -268,6 +233,14 @@ export default function Home() {
 									</div>
 								)}
 							</>
+						) : conversionState.status === 'preview' &&
+						  conversionState.srtContent ? (
+							<SrtPreview
+								srtContent={conversionState.srtContent}
+								filename={conversionState.filename || 'converted.srt'}
+								onDownload={handleDownload}
+								onReset={handleReset}
+							/>
 						) : (
 							<ConversionResult
 								state={conversionState}
@@ -291,12 +264,6 @@ export default function Home() {
 					</div>
 				</div>
 			</div>
-
-			{/* Auth Modal */}
-			<AuthModal
-				isOpen={showAuthModal}
-				onClose={() => setShowAuthModal(false)}
-			/>
 		</div>
 	);
 }
