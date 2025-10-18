@@ -4,16 +4,37 @@
 
 import { useCallback } from 'react';
 
+// Supported languages - should match backend
+const SUPPORTED_LANGUAGES = {
+	auto: 'Auto-detect',
+	en: 'English',
+	hi: 'Hindi',
+	ko: 'Korean',
+	ja: 'Japanese',
+	es: 'Spanish',
+	fr: 'French',
+	de: 'German',
+	it: 'Italian',
+	pt: 'Portuguese',
+	ru: 'Russian',
+	zh: 'Chinese',
+	ar: 'Arabic',
+};
+
 interface ConversionSettingsProps {
 	settings: {
 		wordsPerSegment: number;
 		frameRate: number;
 		useNaturalSegmentation: boolean;
+		inputLanguage: string;
+		targetLanguage: string;
 	};
 	onSettingsChange: (settings: {
 		wordsPerSegment: number;
 		frameRate: number;
 		useNaturalSegmentation: boolean;
+		inputLanguage: string;
+		targetLanguage: string;
 	}) => void;
 	disabled?: boolean;
 }
@@ -59,11 +80,93 @@ export function ConversionSettings({
 		[settings, onSettingsChange]
 	);
 
+	const handleInputLanguageChange = useCallback(
+		(e: React.ChangeEvent<HTMLSelectElement>) => {
+			onSettingsChange({
+				...settings,
+				inputLanguage: e.target.value,
+			});
+		},
+		[settings, onSettingsChange]
+	);
+
+	const handleTargetLanguageChange = useCallback(
+		(e: React.ChangeEvent<HTMLSelectElement>) => {
+			onSettingsChange({
+				...settings,
+				targetLanguage: e.target.value,
+			});
+		},
+		[settings, onSettingsChange]
+	);
+
 	return (
 		<div className="mt-8 space-y-6">
 			<h3 className="text-lg font-semibold text-gray-900 dark:text-white">
 				Conversion Settings
 			</h3>
+
+			{/* Language Settings */}
+			<div className="space-y-4">
+				<h4 className="text-md font-medium text-gray-800 dark:text-gray-200">
+					Language Settings
+				</h4>
+				<div className="grid md:grid-cols-2 gap-4">
+					{/* Input Language */}
+					<div className="space-y-2">
+						<label
+							htmlFor="input-language"
+							className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+						>
+							Input Language
+						</label>
+						<select
+							id="input-language"
+							value={settings.inputLanguage}
+							onChange={handleInputLanguageChange}
+							disabled={disabled}
+							className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed dark:bg-gray-700 dark:text-white dark:disabled:bg-gray-600"
+						>
+							{Object.entries(SUPPORTED_LANGUAGES).map(([code, name]) => (
+								<option key={code} value={code}>
+									{name}
+								</option>
+							))}
+						</select>
+						<p className="text-xs text-gray-500 dark:text-gray-400">
+							Language of the input audio. Auto-detect will let Whisper
+							determine the language automatically.
+						</p>
+					</div>
+
+					{/* Target Language */}
+					<div className="space-y-2">
+						<label
+							htmlFor="target-language"
+							className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+						>
+							Target Language
+						</label>
+						<select
+							id="target-language"
+							value={settings.targetLanguage}
+							onChange={handleTargetLanguageChange}
+							disabled={disabled}
+							className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed dark:bg-gray-700 dark:text-white dark:disabled:bg-gray-600"
+						>
+							{Object.entries(SUPPORTED_LANGUAGES).map(([code, name]) => (
+								<option key={code} value={code}>
+									{name}
+								</option>
+							))}
+						</select>
+						<p className="text-xs text-gray-500 dark:text-gray-400">
+							Language for the output subtitles. Auto will keep the same
+							language as input.
+						</p>
+					</div>
+				</div>
+			</div>
 
 			{/* Natural Segmentation Option */}
 			<div className="space-y-2">
@@ -183,6 +286,48 @@ export function ConversionSettings({
 						onClick={() =>
 							onSettingsChange({
 								...settings,
+								inputLanguage: 'en',
+								targetLanguage: 'hi',
+								frameRate: 30.0,
+							})
+						}
+						disabled={disabled}
+						className="px-3 py-1 text-xs bg-orange-100 hover:bg-orange-200 dark:bg-orange-900/30 dark:hover:bg-orange-900/50 text-orange-700 dark:text-orange-300 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						English → Hindi
+					</button>
+					<button
+						onClick={() =>
+							onSettingsChange({
+								...settings,
+								inputLanguage: 'en',
+								targetLanguage: 'ko',
+								frameRate: 30.0,
+							})
+						}
+						disabled={disabled}
+						className="px-3 py-1 text-xs bg-purple-100 hover:bg-purple-200 dark:bg-purple-900/30 dark:hover:bg-purple-900/50 text-purple-700 dark:text-purple-300 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						English → Korean
+					</button>
+					<button
+						onClick={() =>
+							onSettingsChange({
+								...settings,
+								inputLanguage: 'en',
+								targetLanguage: 'ja',
+								frameRate: 30.0,
+							})
+						}
+						disabled={disabled}
+						className="px-3 py-1 text-xs bg-pink-100 hover:bg-pink-200 dark:bg-pink-900/30 dark:hover:bg-pink-900/50 text-pink-700 dark:text-pink-300 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						English → Japanese
+					</button>
+					<button
+						onClick={() =>
+							onSettingsChange({
+								...settings,
 								wordsPerSegment: 6,
 								frameRate: 30.0,
 								useNaturalSegmentation: false,
@@ -266,6 +411,33 @@ export function ConversionSettings({
 					Current Settings
 				</h4>
 				<div className="text-sm text-gray-600 dark:text-gray-400 space-y-1">
+					<p>
+						• Input language:{' '}
+						<strong>
+							{
+								SUPPORTED_LANGUAGES[
+									settings.inputLanguage as keyof typeof SUPPORTED_LANGUAGES
+								]
+							}
+						</strong>
+					</p>
+					<p>
+						• Target language:{' '}
+						<strong>
+							{
+								SUPPORTED_LANGUAGES[
+									settings.targetLanguage as keyof typeof SUPPORTED_LANGUAGES
+								]
+							}
+						</strong>
+						{settings.inputLanguage !== settings.targetLanguage &&
+							settings.targetLanguage !== 'auto' && (
+								<span className="text-blue-600 dark:text-blue-400">
+									{' '}
+									(Translation enabled)
+								</span>
+							)}
+					</p>
 					{settings.useNaturalSegmentation ? (
 						<>
 							<p>
