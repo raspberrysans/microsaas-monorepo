@@ -20,6 +20,40 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Supported languages for input and translation
+SUPPORTED_LANGUAGES = {
+    'auto': 'Auto-detect',
+    'en': 'English',
+    'hi': 'Hindi',
+    'ko': 'Korean',
+    'ja': 'Japanese',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'it': 'Italian',
+    'pt': 'Portuguese',
+    'ru': 'Russian',
+    'zh': 'Chinese',
+    'ar': 'Arabic'
+}
+
+# Language code mapping for Whisper (some codes differ from Google Translate)
+WHISPER_LANGUAGE_MAP = {
+    'auto': None,  # Let Whisper auto-detect
+    'en': 'en',
+    'hi': 'hi',
+    'ko': 'ko',
+    'ja': 'ja',
+    'es': 'es',
+    'fr': 'fr',
+    'de': 'de',
+    'it': 'it',
+    'pt': 'pt',
+    'ru': 'ru',
+    'zh': 'zh',
+    'ar': 'ar'
+}
+
 app = FastAPI(title="M4A to SRT Converter", version="1.0.0")
 
 # Add CORS middleware
@@ -136,7 +170,7 @@ async def convert_audio_to_wav(audio_path: str) -> str:
     except FileNotFoundError:
         raise Exception("FFmpeg not found. Please install ffmpeg.")
 
-async def transcribe_with_whisper_word_timestamps(audio_path: str) -> tuple[list, dict]:
+async def transcribe_with_whisper_word_timestamps(audio_path: str, input_language: Optional[str] = None) -> tuple[list, dict]:
     """Use OpenAI Whisper for transcription with word-level timestamps"""
     logger.info("Transcribing audio with Whisper word-level timestamps...")
     
@@ -145,12 +179,24 @@ async def transcribe_with_whisper_word_timestamps(audio_path: str) -> tuple[list
         
         # Try to use whisper command line tool with word-level timestamps
         temp_dir = tempfile.mkdtemp()
-        process = await asyncio.create_subprocess_exec(
+        
+        # Build command with optional language parameter
+        cmd = [
             'whisper', audio_path, 
             '--model', 'base',
             '--output_format', 'json',
             '--word_timestamps', 'True',
-            '--output_dir', temp_dir,
+            '--output_dir', temp_dir
+        ]
+        
+        # Add language parameter if specified
+        if input_language and input_language in WHISPER_LANGUAGE_MAP:
+            whisper_lang = WHISPER_LANGUAGE_MAP[input_language]
+            if whisper_lang:  # Only add if not None (auto-detect)
+                cmd.extend(['--language', whisper_lang])
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -214,9 +260,9 @@ async def transcribe_with_whisper_word_timestamps(audio_path: str) -> tuple[list
         raise
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning("Whisper CLI not found or failed, falling back to Python whisper...")
-        return await transcribe_with_python_whisper(audio_path)
+        return await transcribe_with_python_whisper(audio_path, input_language)
 
-async def transcribe_with_python_whisper(audio_path: str) -> tuple[list, dict]:
+async def transcribe_with_python_whisper(audio_path: str, input_language: Optional[str] = None) -> tuple[list, dict]:
     """Fallback transcription using Python whisper library"""
     logger.info("Transcribing audio with Python whisper library...")
     
@@ -230,9 +276,18 @@ async def transcribe_with_python_whisper(audio_path: str) -> tuple[list, dict]:
         await check_cancellation()
         
         # This is a CPU-intensive operation, so we run it in a thread
+        # Prepare transcription parameters
+        transcribe_params = {'word_timestamps': True}
+        
+        # Add language parameter if specified
+        if input_language and input_language in WHISPER_LANGUAGE_MAP:
+            whisper_lang = WHISPER_LANGUAGE_MAP[input_language]
+            if whisper_lang:  # Only add if not None (auto-detect)
+                transcribe_params['language'] = whisper_lang
+        
         result = await loop.run_in_executor(
             None, 
-            lambda: model.transcribe(audio_path, word_timestamps=True)
+            lambda: model.transcribe(audio_path, **transcribe_params)
         )
         
         await check_cancellation()
@@ -319,6 +374,50 @@ def use_natural_segments(whisper_result: dict) -> list:
     
     return subtitles
 
+def make_subtitles_contiguous(subtitles: list) -> list:
+    """Ensure each subtitle displays until the next one starts (no gaps).
+
+    Adjusts end_time of each subtitle (except the last) to match the next
+    subtitle's start_time if there is a gap. Overlapping segments are left as-is.
+    """
+    if not subtitles:
+        return subtitles
+    for i in range(len(subtitles) - 1):
+        current = subtitles[i]
+        next_start = subtitles[i + 1]['start_time']
+        if next_start > current['end_time']:
+            current['end_time'] = next_start
+    return subtitles
+
+async def translate_subtitles(subtitles: list, target_language: str, source_language: str = 'auto') -> list:
+    """Translate subtitle text to target language using batch translation for better accuracy."""
+    if target_language == 'auto' or target_language == source_language:
+        return subtitles
+    
+    logger.info(f"Translating {len(subtitles)} subtitles from {source_language} to {target_language}...")
+    
+    # Extract all text for batch translation (better context and accuracy)
+    texts_to_translate = [subtitle['text'] for subtitle in subtitles]
+    
+    # Translate all texts together
+    translated_texts = await translate_text_batch(
+        texts_to_translate,
+        target_language,
+        source_language
+    )
+    
+    # Combine translated texts with original timing
+    translated_subtitles = []
+    for i, subtitle in enumerate(subtitles):
+        translated_subtitles.append({
+            'text': translated_texts[i],
+            'start_time': subtitle['start_time'],
+            'end_time': subtitle['end_time']
+        })
+    
+    logger.info(f"Translation completed: {len(translated_subtitles)} subtitles translated successfully")
+    return translated_subtitles
+
 def generate_srt_from_subtitles(subtitles: list) -> str:
     """Generate SRT content from subtitle segments."""
     srt_content = []
@@ -338,7 +437,8 @@ async def process_conversion_async(
     temp_m4a_path: str, 
     words_per_segment: Optional[int], 
     frame_rate: float,
-    use_natural_segmentation: bool = False
+    use_natural_segmentation: bool = False,
+    input_language: str = 'auto'
 ) -> tuple[str, str]:
     """Main async conversion logic that can be cancelled."""
     wav_path = None
@@ -350,8 +450,8 @@ async def process_conversion_async(
         logger.info(f"WAV file created: {wav_path}")
         
         # Transcribe audio with word-level timestamps
-        logger.info("Transcribing audio with word-level timestamps...")
-        words_with_timing, whisper_result = await transcribe_with_whisper_word_timestamps(wav_path)
+        logger.info(f"Transcribing audio with word-level timestamps (input language: {input_language})...")
+        words_with_timing, whisper_result = await transcribe_with_whisper_word_timestamps(wav_path, input_language)
         
         if not words_with_timing and not whisper_result.get('segments'):
             raise HTTPException(status_code=400, detail="No speech detected in audio file")
@@ -364,6 +464,9 @@ async def process_conversion_async(
         if use_natural_segmentation:
             logger.info("Using Whisper's natural segmentation...")
             subtitles = use_natural_segments(whisper_result)
+            # When using language detection with natural segmentation, ensure
+            # subtitles persist on screen until the next sentence begins.
+            subtitles = make_subtitles_contiguous(subtitles)
         else:
             # Group words into subtitles
             logger.info(f"Grouping words into subtitles (max {words_per_segment} words per subtitle)...")
@@ -410,7 +513,8 @@ async def convert_m4a_to_srt(
     file: UploadFile = File(...),
     words_per_segment: Optional[int] = Form(8, description="Number of words per subtitle segment (default: 8)"),
     frame_rate: Optional[float] = Form(30.0, description="Frame rate for timing calculations (default: 30.0)"),
-    use_natural_segmentation: Optional[bool] = Form(False, description="Use Whisper's natural segmentation instead of word-based grouping")
+    use_natural_segmentation: Optional[bool] = Form(False, description="Use Whisper's natural segmentation instead of word-based grouping"),
+    input_language: Optional[str] = Form('auto', description="Input audio language (default: auto-detect)")
 ):
     global _current_task, _current_request
     
@@ -440,6 +544,10 @@ async def convert_m4a_to_srt(
     if frame_rate <= 0:
         raise HTTPException(status_code=400, detail="Frame rate must be positive")
     
+    # Validate language parameter
+    if input_language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=400, detail=f"Unsupported input language: {input_language}")
+    
     # Register new request and handle cancellation
     cancelled_request = register_new_request(request_id, file.filename)
     
@@ -457,7 +565,13 @@ async def convert_m4a_to_srt(
         
         # Create and store the processing task
         async def conversion_task():
-            return await process_conversion_async(temp_m4a_path, words_per_segment, frame_rate, use_natural_segmentation)
+            return await process_conversion_async(
+                temp_m4a_path, 
+                words_per_segment, 
+                frame_rate, 
+                use_natural_segmentation,
+                input_language
+            )
         
         _current_task = asyncio.create_task(conversion_task())
         
@@ -554,6 +668,11 @@ async def root():
         </body>
     </html>
     """)
+
+@app.get("/api/languages")
+async def get_supported_languages():
+    """Get list of supported languages for input and translation."""
+    return {"languages": SUPPORTED_LANGUAGES}
 
 @app.get("/health")
 async def health():

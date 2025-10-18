@@ -28,6 +28,8 @@ export default function Home() {
 		wordsPerSegment: 8,
 		frameRate: 30.0,
 		useNaturalSegmentation: false,
+		inputLanguage: 'auto',
+		targetLanguage: 'auto',
 	});
 
 	const handleFileSelect = useCallback((selectedFile: File) => {
@@ -49,6 +51,8 @@ export default function Home() {
 				'use_natural_segmentation',
 				settings.useNaturalSegmentation.toString()
 			);
+			formData.append('input_language', settings.inputLanguage);
+			formData.append('target_language', settings.targetLanguage);
 
 			setConversionState({ status: 'converting', progress: 50 });
 
@@ -101,8 +105,7 @@ export default function Home() {
 		if (!conversionState.downloadToken) return;
 
 		try {
-			const backendUrl =
-				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+			const backendUrl = 'http://localhost:8000';
 
 			const response = await fetch(
 				`${backendUrl}/api/download/${conversionState.downloadToken}`,
