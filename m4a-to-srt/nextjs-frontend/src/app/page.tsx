@@ -56,8 +56,9 @@ export default function Home() {
 
 			setConversionState({ status: 'converting', progress: 50 });
 
-			// You can change this URL to your actual backend URL
-			const backendUrl = 'http://localhost:8000';
+			// Resolve backend URL from environment for dev/prod flexibility
+			const backendUrl =
+				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
 			const response = await fetch(`${backendUrl}/api/convert`, {
 				method: 'POST',
@@ -105,7 +106,8 @@ export default function Home() {
 		if (!conversionState.downloadToken) return;
 
 		try {
-			const backendUrl = 'http://localhost:8000';
+			const backendUrl =
+				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
 			const response = await fetch(
 				`${backendUrl}/api/download/${conversionState.downloadToken}`,
