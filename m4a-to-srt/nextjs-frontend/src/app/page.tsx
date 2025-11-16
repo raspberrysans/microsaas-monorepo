@@ -24,6 +24,11 @@ export default function Home() {
 		status: 'idle',
 	});
 
+	const isDevelopment = process.env.NODE_ENV === 'development';
+	const backendUrl = isDevelopment
+		? 'http://localhost:8000'
+		: process.env.NEXT_PUBLIC_BACKEND_URL;
+
 	const [settings, setSettings] = useState({
 		wordsPerSegment: 8,
 		frameRate: 30.0,
@@ -55,10 +60,6 @@ export default function Home() {
 			formData.append('target_language', settings.targetLanguage);
 
 			setConversionState({ status: 'converting', progress: 50 });
-
-			// Resolve backend URL from environment for dev/prod flexibility
-			const backendUrl =
-				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
 			const response = await fetch(`${backendUrl}/api/convert`, {
 				method: 'POST',
@@ -106,9 +107,6 @@ export default function Home() {
 		if (!conversionState.downloadToken) return;
 
 		try {
-			const backendUrl =
-				process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
-
 			const response = await fetch(
 				`${backendUrl}/api/download/${conversionState.downloadToken}`,
 				{
